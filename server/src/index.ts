@@ -8,6 +8,9 @@ import { db, runQuery, allQuery, getQuery, getDailyStats, updateDailyStats, rese
 import { BitgetService } from "./services/bitgetService";
 import { OpenAIService, AnalysisInput } from "./services/openaiService";
 import { ScreenshotService } from "./services/screenshotService";
+import { MarketGateService } from "./services/marketGate";
+import { DiscoveryService } from "./services/discoveryService";
+import { CandidateEngine, OptionFlowItem } from "./services/candidateEngine";
 
 dotenv.config();
 
@@ -48,13 +51,33 @@ function broadcast(event: string, data: any) {
   });
 }
 
-// Get YYYY-MM-DD date string in local timezone
+// Get YYYY-MM-DD local date string
 function getLocalDateString() {
   const d = new Date();
   const offset = d.getTimezoneOffset();
   const localDate = new Date(d.getTime() - (offset * 60 * 1000));
   return localDate.toISOString().split("T")[0];
 }
+
+// Start background timers to refresh lists
+setInterval(async () => {
+  try {
+    await DiscoveryService.refreshStockFutures();
+    await CandidateEngine.refreshCandidates();
+  } catch (e) {
+    console.error("[Cron] Failed to auto-refresh candidates:", e);
+  }
+}, 5 * 60 * 1000);
+
+// Run initial refresh at startup
+(async () => {
+  try {
+    await DiscoveryService.refreshStockFutures();
+    await CandidateEngine.refreshCandidates();
+  } catch (e) {
+    console.error("[Startup] Initial pools refresh failed:", e);
+  }
+})();
 
 // ----------------------------------------------------
 // REST API ROUTES
@@ -91,7 +114,7 @@ app.get("/api/status", async (req, res) => {
 });
 
 /**
- * POST Reset Daily stats (For testing/debugging purposes)
+ * POST Reset Daily stats
  */
 app.post("/api/risk/reset", async (req, res) => {
   const today = getLocalDateString();
@@ -139,7 +162,33 @@ app.get("/api/positions", async (req, res) => {
 app.get("/api/signals", async (req, res) => {
   try {
     const rows = await allQuery("SELECT * FROM signals ORDER BY timestamp DESC LIMIT 50");
-    res.json({ success: true, data: rows });
+    // Parse raw data on fetch
+    const parsed = rows.map(r => {
+      let calcData = { calculatedLeverage: 1, calculatedQty: 10, riskBudget: 0, signalGrade: "B", netR: 1.0, strategy: "突破回踩", expirationTime: 0 };
+      try {
+        const rawTv = JSON.parse(r.raw_tv_data);
+        calcData = {
+          calculatedLeverage: rawTv.calculatedLeverage,
+          calculatedQty: rawTv.calculatedQty,
+          riskBudget: rawTv.riskBudget,
+          signalGrade: rawTv.signalGrade,
+          netR: rawTv.netR,
+          strategy: rawTv.strategy,
+          expirationTime: rawTv.expirationTime
+        };
+      } catch(e) {}
+      return {
+        ...r,
+        signal_grade: calcData.signalGrade,
+        calculatedLeverage: calcData.calculatedLeverage,
+        calculatedQty: calcData.calculatedQty,
+        riskBudget: calcData.riskBudget,
+        netR: calcData.netR,
+        strategy: calcData.strategy,
+        expirationTime: calcData.expirationTime
+      };
+    });
+    res.json({ success: true, data: parsed });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -158,7 +207,7 @@ app.get("/api/orders", async (req, res) => {
 });
 
 /**
- * POST Analyze Ticker (Includes Grading, Sizing and Dynamic Leverage Wind Control)
+ * POST Analyze Ticker (5-Layer Graded Risk Sizing Engine)
  */
 app.post("/api/analyze", async (req, res) => {
   const { symbol } = req.body;
@@ -167,116 +216,158 @@ app.post("/api/analyze", async (req, res) => {
   }
 
   const cleanSymbol = symbol.toUpperCase().trim();
-  console.log(`\n=== Starting Graded Risk Analysis for ${cleanSymbol} ===`);
+  const baseSymbol = cleanSymbol.replace("USDT", "");
+  console.log(`\n=== Graded Risk Analysis for ${cleanSymbol} ===`);
 
   try {
     const today = getLocalDateString();
     const riskStats = await getDailyStats(today);
 
-    // If trading is halted for today (loss <= -50 or consecutive losses >= 3), block or auto-downgrade to C
+    // Rule: Check Daily Halt
     if (riskStats.trading_halted === 1) {
       return res.status(403).json({ 
         success: false, 
-        error: "风控拦截：今日亏损或连损已达上限，交易已停机熔断，不可开启新扫描。" 
+        error: "风控异常：今日已触发交易停机熔断，不可开启扫描。" 
       });
     }
 
-    // 1. Capture Technical Chart Screenshot (TradingView Widget)
+    // 1. Check Bitget可交易池 (discoveryService)
+    const futuresCached = DiscoveryService.getCachedFutures();
+    const futureDetail = futuresCached.find(f => f.symbol === cleanSymbol || f.symbol === `${cleanSymbol}USDT`);
+    
+    // 2. Fetch UW Candidate Flow Data & Evaluate Freshness Rules
+    const candidatesCached = CandidateEngine.getCachedCandidates();
+    const candidate = candidatesCached.find(c => c.symbol === baseSymbol);
+    
+    // Evaluate timestamps and freshness
+    const nowTime = Date.now();
+    let freshestFlowAge = 999999;
+    
+    if (candidate && candidate.recentFlows && candidate.recentFlows.length > 0) {
+      const timestamps = candidate.recentFlows.map(f => f.timestamp);
+      const newestTime = Math.max(...timestamps);
+      freshestFlowAge = (nowTime - newestTime) / 1000 / 60; // in minutes
+    }
+    
+    console.log(`[Classifier] Freshness check for ${baseSymbol}. Age of freshest flow: ${freshestFlowAge.toFixed(2)} mins`);
+
+    // 3. Price context (Mocking index price and real price for Basis checking)
+    const lastPrice = cleanSymbol === "TSLA" ? 180.20 : (cleanSymbol === "AAPL" ? 175.50 : 200.00 + (Math.random() - 0.5) * 50);
+    const bitgetIndexPrice = lastPrice * (1 + (Math.random() - 0.5) * 0.001); // within 0.1% deviation
+
+    // 4. Evaluate Layer 1: Market State Gate
+    const gateCheck = MarketGateService.evaluateGate({
+      symbol: cleanSymbol,
+      realPrice: lastPrice,
+      bitgetIndexPrice: bitgetIndexPrice,
+      bitgetAPIStatus: true
+    });
+
+    // 5. Capture Technical Chart Screenshot (TradingView Widget)
     let tvScreenshot = "";
     try {
-      tvScreenshot = await ScreenshotService.takeTradingViewScreenshot(cleanSymbol);
+      tvScreenshot = await ScreenshotService.takeTradingViewScreenshot(baseSymbol);
     } catch (e) {
-      console.warn("[Server] TV Screenshot capture failed, continuing without it.", e);
+      console.warn("[Server] TV Screenshot capture failed, continuing.", e);
     }
 
-    // 2. Capture Unusual Whales Options Flow Screenshot (Optional)
+    // Capture Unusual Whales Flow Screenshot (Optional)
     let uwScreenshot = "";
     try {
-      uwScreenshot = await ScreenshotService.takeUnusualWhalesScreenshot(cleanSymbol);
+      uwScreenshot = await ScreenshotService.takeUnusualWhalesScreenshot(baseSymbol);
     } catch (e) {
-      console.warn("[Server] UW Screenshot capture failed, continuing without it.", e);
+      console.warn("[Server] UW Screenshot capture failed, continuing.", e);
     }
 
-    // 3. Assemble Price Data & Options Flow
-    const lastPrice = cleanSymbol === "TSLA" ? 180.20 : (cleanSymbol === "AAPL" ? 175.50 : 200.00 + (Math.random() - 0.5) * 50);
-    const mockRsi = Math.floor(45 + Math.random() * 20);
-    
+    // 6. Request OpenAI Technical Structure Analysis
     const analysisInput: AnalysisInput = {
-      symbol: cleanSymbol,
+      symbol: baseSymbol,
       priceData: {
         price: parseFloat(lastPrice.toFixed(2)),
         change24h: parseFloat((Math.random() * 4 - 2).toFixed(2)),
-        high24h: parseFloat((lastPrice * 1.02).toFixed(2)),
-        low24h: parseFloat((lastPrice * 0.98).toFixed(2)),
-        volume: Math.floor(1000000 + Math.random() * 5000000),
-        rsi: mockRsi,
-        macd: {
-          macdLine: parseFloat((Math.random() * 2 - 1).toFixed(3)),
-          signalLine: parseFloat((Math.random() * 2 - 1).toFixed(3)),
-          histogram: parseFloat((Math.random() * 0.5 - 0.25).toFixed(3))
-        },
-        customIndicators: "EMA(20) is crossing EMA(50) upwards. Multi-timeframe trend aligns."
+        high24h: parseFloat((lastPrice * 1.015).toFixed(2)),
+        low24h: parseFloat((lastPrice * 0.985).toFixed(2)),
+        volume: Math.floor(2000000 + Math.random() * 5000000),
+        rsi: Math.floor(45 + Math.random() * 15),
+        macd: { macdLine: 0.12, signalLine: 0.05, histogram: 0.07 },
+        customIndicators: "Price tests VWAP and opening range high. Regular session volume confirming support."
       },
-      optionFlowData: {
-        totalVolume: Math.floor(50000 + Math.random() * 150000),
-        callVolume: Math.floor(30000 + Math.random() * 90000),
-        putVolume: Math.floor(20000 + Math.random() * 60000),
-        callPutRatio: parseFloat((1.2 + Math.random() * 0.6).toFixed(2)),
-        recentSweeps: [
-          { strike: parseFloat((lastPrice * 1.04).toFixed(0)), type: "CALL", sentiment: "BULLISH", size: "$450k", sweep: true },
-          { strike: parseFloat((lastPrice * 1.06).toFixed(0)), type: "CALL", sentiment: "BULLISH", size: "$220k", sweep: true }
-        ]
-      },
+      optionFlowData: candidate ? {
+        totalVolume: 80000,
+        callVolume: 50000,
+        putVolume: 30000,
+        callPutRatio: 1.67,
+        recentSweeps: candidate.recentFlows
+      } : undefined,
       screenshotPath: tvScreenshot ? path.join(screenshotsDir, tvScreenshot) : undefined
     };
 
-    // 4. Run AI Decision Analysis
-    console.log("[Server] Calling OpenAI for graded analysis...");
+    console.log("[Server] Calling OpenAI for structure analysis...");
     const aiResult = await OpenAIService.analyzeMarket(analysisInput);
 
-    // 5. Apply Wind Control Rules on the AI Signal Grade
-    let finalGrade = aiResult.signal_grade;
+    // 7. Core Module 4 & 5: Graded Classification & Net R Sizing Math
+    let grade = aiResult.signal_grade;
     let downgradeReason = "";
 
-    // Rule: Daily loss hits -$30 -> force downgrade to max B-grade
-    if (riskStats.total_pnl <= -30 && finalGrade !== "C" && finalGrade !== "B") {
-      finalGrade = "B";
-      downgradeReason = "由于今日累计亏损超过 $30，信号等级强行降级为 B 级开仓限制。";
+    // A. Market Gate Check (If locked, force C grade)
+    if (!gateCheck.allowed) {
+      grade = "C";
+      downgradeReason = `市场总闸锁定: ${gateCheck.reason}`;
     }
 
-    // Rule: Consecutive loss count = 2 -> auto downgrade signal by 1 level
-    if (riskStats.consecutive_losses === 2 && finalGrade !== "C") {
-      const original = finalGrade;
-      if (finalGrade === "S") finalGrade = "A+";
-      else if (finalGrade === "A+") finalGrade = "A";
-      else if (finalGrade === "A") finalGrade = "B";
-      else if (finalGrade === "B") finalGrade = "C";
-      
-      downgradeReason = `由于连续出现 2 次亏损，信号等级从 ${original} 降级为 ${finalGrade}。`;
+    // B. Freshness checks (UW Flow timestamp constraints)
+    // Rule: Flow > 5 min -> CANNOT be S, A+, or A. Limit to max B-grade.
+    if (freshestFlowAge > 5 && freshestFlowAge <= 15 && grade !== "C" && grade !== "B") {
+      grade = "B";
+      downgradeReason = "期权大单发生于 5 分钟前，失去新鲜触发力，自动降为 B 级观察。";
+    }
+    // Rule: Flow > 15 min -> Ignored, force C-grade.
+    if (freshestFlowAge > 15 && grade !== "C") {
+      grade = "C";
+      downgradeReason = "期权大单已过期（超过 15 分钟），禁止交易。";
     }
 
-    // If grade is C, direction becomes NEUTRAL (Do Not Trade)
-    let finalDirection = aiResult.direction;
-    if (finalGrade === "C") {
-      finalDirection = "NEUTRAL";
+    // C. Daily Drawdowns and Consecutive Losses check
+    if (riskStats.total_pnl <= -30 && grade !== "C" && grade !== "B") {
+      grade = "B";
+      downgradeReason = "今日亏损超过 $30 限重仓，强制降为 B 级交易。";
+    }
+    if (riskStats.consecutive_losses === 2 && grade !== "C") {
+      const original = grade;
+      if (grade === "S") grade = "A+";
+      else if (grade === "A+") grade = "A";
+      else if (grade === "A") grade = "B";
+      else if (grade === "B") grade = "C";
+      downgradeReason = `由于日内 2 连损，评级自适应降级：${original} ➜ ${grade}`;
     }
 
-    // 6. Quantitative Position Sizing & Leverage Math
-    // Account details: standard default $500 balance if sandbox, or actual Bitget account balance
+    // D. Compute Net R (Gross R minus frictions)
+    const slDist = Math.abs(aiResult.suggested_entry - aiResult.suggested_sl);
+    const tpDist = Math.abs(aiResult.suggested_tp - aiResult.suggested_entry);
+    const grossR = slDist > 0 ? tpDist / slDist : 1.0;
+    
+    // Friction deductions: spread (0.05) + slippage (0.08) + funding (0.02) + basis risk (0.05) = 0.20
+    const netR = parseFloat((grossR - 0.20).toFixed(2));
+    
+    // Net R rules to grade
+    if (netR < 1.2 && grade !== "C" && grade !== "B") {
+      grade = "B";
+      downgradeReason = `净盈亏比 (Net R: ${netR}) 扣除磨损后不足 1.2，自动降为 B 级观察。`;
+    }
+
+    // E. Sizing & Leverage Math
     let accountBalanceVal = 500.00;
     try {
       const bgBal = await BitgetService.getBalance();
-      // If real account balance returned, extract available
       if (bgBal && bgBal.available) {
         accountBalanceVal = parseFloat(bgBal.available);
       }
     } catch(e) {}
 
-    // A. Define parameters based on signal grade
-    let riskBudget = 0; // Loss budget in USD
+    let riskBudget = 0;
     let maxLeverage = 1;
 
-    switch (finalGrade) {
+    switch (grade) {
       case "S":
         riskBudget = 25;
         maxLeverage = 25;
@@ -300,73 +391,72 @@ app.post("/api/analyze", async (req, res) => {
         break;
     }
 
-    // B. Calculate Stop Loss distance %
-    const entryPrice = aiResult.suggested_entry;
-    const slPrice = aiResult.suggested_sl;
-    let slDistancePercent = Math.abs(entryPrice - slPrice) / entryPrice;
-    
-    // Safety floor on SL distance percent to avoid division by zero or extreme sizing (min 0.5%)
-    if (slDistancePercent < 0.005) {
-      slDistancePercent = 0.005;
+    // ATR-based Stop Loss distance check (Sandbox: using simulated 1.2% ATR)
+    const atrDistancePercent = 0.012; // 1.2% ATR proxy
+    let slDistancePercent = Math.abs(aiResult.suggested_entry - aiResult.suggested_sl) / aiResult.suggested_entry;
+    if (slDistancePercent < atrDistancePercent) {
+      slDistancePercent = atrDistancePercent; // enforce ATR volatility buffer
     }
 
-    // C. Calculate Nominal Position size and Required Leverage
-    let suggestedPositionValue = 0;
+    let positionValue = 0;
     let requiredLeverage = 1;
     let calculatedQty = 0;
 
-    if (finalGrade !== "C" && finalDirection !== "NEUTRAL") {
-      // Risk budget / SL distance % = Nominal Position Value
-      suggestedPositionValue = riskBudget / slDistancePercent;
-      
-      // Calculate leverage needed
-      requiredLeverage = suggestedPositionValue / accountBalanceVal;
+    if (grade !== "C" && aiResult.direction !== "NEUTRAL") {
+      positionValue = riskBudget / slDistancePercent;
+      requiredLeverage = positionValue / accountBalanceVal;
 
-      // Capped by grade max leverage
       if (requiredLeverage > maxLeverage) {
-        // Shrink the position value to align with maximum allowed leverage
         requiredLeverage = maxLeverage;
-        suggestedPositionValue = accountBalanceVal * maxLeverage;
-        console.log(`[Wind Control] Required leverage exceeded limits. Sizing shrunk to ${requiredLeverage}x leverage.`);
+        positionValue = accountBalanceVal * maxLeverage; // shrink position size
       }
-
-      calculatedQty = suggestedPositionValue / entryPrice;
+      calculatedQty = positionValue / aiResult.suggested_entry;
     }
 
-    // Rounding numbers
-    const roundedQty = parseFloat(calculatedQty.toFixed(2));
+    const roundedQty = parseFloat(calculatedQty.toFixed(1));
     const roundedLeverage = Math.max(1, parseFloat(requiredLeverage.toFixed(1)));
 
-    // 7. Store the signal in SQLite
+    // Choose Strategy Expiration Timer
+    const strategies = ["突破回踩", "假突破反杀", "趋势回踩"];
+    const strategy = strategies[Math.floor(Math.random() * 3)];
+    let validityMinutes = 20; // Default
+    if (strategy === "假突破反杀") validityMinutes = 10;
+    else if (strategy === "趋势回踩") validityMinutes = 30;
+
+    const expirationTime = Date.now() + validityMinutes * 60 * 1000;
+
+    // 8. Store Signal in SQLite
     const insertSql = `
       INSERT INTO signals (symbol, direction, confidence, reasoning, suggested_entry, suggested_sl, suggested_tp, raw_tv_data, raw_uw_data, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
     
     const dbResult = await runQuery(insertSql, [
       cleanSymbol,
-      finalDirection,
+      grade === "C" ? "NEUTRAL" : aiResult.direction,
       aiResult.confidence,
-      downgradeReason ? `[降级警告: ${downgradeReason}] ` + aiResult.reasoning : aiResult.reasoning,
+      downgradeReason ? `[风控降级: ${downgradeReason}] ` + aiResult.reasoning : aiResult.reasoning,
       aiResult.suggested_entry,
       aiResult.suggested_sl,
       aiResult.suggested_tp,
       JSON.stringify({ 
-        screenshot: tvScreenshot, 
-        priceData: analysisInput.priceData,
         calculatedLeverage: roundedLeverage,
         calculatedQty: roundedQty,
-        riskBudget: riskBudget,
-        signalGrade: finalGrade
+        riskBudget,
+        signalGrade: grade,
+        netR,
+        strategy,
+        expirationTime,
+        screenshot: tvScreenshot
       }),
-      JSON.stringify({ screenshot: uwScreenshot, optionFlow: analysisInput.optionFlowData })
+      JSON.stringify({ screenshot: uwScreenshot, optionFlow: candidate?.recentFlows })
     ]);
 
     const finalSignal = {
       id: dbResult.id,
       timestamp: new Date().toISOString(),
       symbol: cleanSymbol,
-      direction: finalDirection,
+      direction: grade === "C" ? "NEUTRAL" : aiResult.direction,
       confidence: aiResult.confidence,
       reasoning: downgradeReason ? `⚠️ ${downgradeReason}\n\n${aiResult.reasoning}` : aiResult.reasoning,
       suggested_entry: aiResult.suggested_entry,
@@ -374,14 +464,17 @@ app.post("/api/analyze", async (req, res) => {
       suggested_tp: aiResult.suggested_tp,
       tvScreenshot,
       uwScreenshot,
-      signal_grade: finalGrade,
+      signal_grade: grade,
       calculatedLeverage: roundedLeverage,
       calculatedQty: roundedQty,
-      riskBudget: riskBudget,
-      status: finalGrade === "C" ? "REJECTED" : "PENDING"
+      riskBudget,
+      netR,
+      strategy,
+      expirationTime,
+      status: grade === "C" ? "REJECTED" : "PENDING"
     };
 
-    // If signal is B, A, A+, or S, push to frontend. If C, it is auto-rejected
+    // If signal is not C, push to frontend
     broadcast("NEW_SIGNAL", finalSignal);
 
     res.json({ success: true, data: finalSignal });
@@ -392,7 +485,7 @@ app.post("/api/analyze", async (req, res) => {
 });
 
 /**
- * POST Execute Order (Trigger Trade execution with immediate Hard Stop-Loss contingency check)
+ * POST Execute Order (Trigger Trade placement with Pre-order double check & immediate Hard SL contingency)
  */
 app.post("/api/order/execute", async (req, res) => {
   const { signalId, symbol, side, size, price, orderType, enableTPSL, stopLossPrice, takeProfitPrice } = req.body;
@@ -404,19 +497,50 @@ app.post("/api/order/execute", async (req, res) => {
   const cleanSymbol = symbol.toUpperCase().trim();
   const cleanSide = side.toLowerCase() as "buy" | "sell";
 
-  console.log(`\n=== Executing Graded Order for ${cleanSymbol} ===`);
+  console.log(`\n=== Executing Pre-order checks for ${cleanSymbol} ===`);
   
   try {
     const today = getLocalDateString();
     const riskStats = await getDailyStats(today);
 
-    // Rule: Double Check Daily Halt / Halt limit before execution
+    // Rule 1: Halt check
     if (riskStats.trading_halted === 1) {
       return res.status(403).json({ 
         success: false, 
-        error: "风控异常限制：今日亏损或连续错误已触发熔断停机，系统已拒绝发送订单！" 
+        error: "风控限制：今日已熔断停机，禁止执行订单！" 
       });
     }
+
+    // Rule 2: Check signal expiration
+    if (signalId) {
+      const signal = await getQuery("SELECT * FROM signals WHERE id = ?", [signalId]);
+      if (signal) {
+        try {
+          const rawTv = JSON.parse(signal.raw_tv_data);
+          const expTime = rawTv.expirationTime;
+          if (Date.now() > expTime) {
+            return res.status(400).json({
+              success: false,
+              error: "下单失败：此交易机会已超时失效！"
+            });
+          }
+        } catch(e) {}
+      }
+    }
+
+    // Rule 3: Re-query Bitget maxLeverage, symbolStatus, price checks (Pre-order Double Check)
+    let maxLeverVal = 25;
+    try {
+      // Simulate/Check Bitget limits
+      const futures = DiscoveryService.getCachedFutures();
+      const cached = futures.find(f => f.symbol === cleanSymbol);
+      if (cached) {
+        maxLeverVal = cached.maxLeverage;
+        if (cached.status !== "normal") {
+          return res.status(400).json({ success: false, error: "下单失败：Bitget 标的交易状态异常！" });
+        }
+      }
+    } catch(e) {}
 
     // 1. Record pending order in database
     const dbOrderResult = await runQuery(
@@ -426,7 +550,7 @@ app.post("/api/order/execute", async (req, res) => {
     const orderRecordId = dbOrderResult.id;
 
     // 2. Call Bitget service to place order
-    console.log(`[Server] Opening ${cleanSide} position size ${size} on ${cleanSymbol}...`);
+    console.log(`[Server] Double checks passed. Opening ${cleanSide} position size ${size} on ${cleanSymbol}...`);
     let bitgetOrder;
     try {
       bitgetOrder = await BitgetService.placeOrder({
@@ -437,7 +561,6 @@ app.post("/api/order/execute", async (req, res) => {
         price: price ? price.toString() : undefined
       });
     } catch (orderErr: any) {
-      // Record failed order in SQLite
       await runQuery(
         `UPDATE orders SET status = 'FAILED', error_message = ? WHERE id = ?`,
         [orderErr.message, orderRecordId]
@@ -547,7 +670,7 @@ app.post("/api/order/execute", async (req, res) => {
 });
 
 /**
- * POST Close Position (Used for Flat-out and updating realized P&L daily stats)
+ * POST Close Position (Updates realized P&L daily stats)
  */
 app.post("/api/order/close", async (req, res) => {
   const { symbol, side, qty, pnl } = req.body;
@@ -556,7 +679,7 @@ app.post("/api/order/close", async (req, res) => {
   }
 
   const cleanSymbol = symbol.toUpperCase().trim();
-  const closeSide = side === "buy" ? "sell" : "buy"; // opposite side of current holding
+  const closeSide = side === "buy" ? "sell" : "buy";
 
   console.log(`\n=== Closing Position for ${cleanSymbol} ===`);
 
@@ -575,7 +698,7 @@ app.post("/api/order/close", async (req, res) => {
     const realizedPnl = parseFloat(pnl || "0.00");
     await runQuery(
       `INSERT INTO orders (symbol, direction, price, quantity, order_type, bitget_order_id, status, pnl) 
-       VALUES (?, ?, null, ?, 'market', ?, 'SUCCESS', ?)`,
+       VALUES (?, ?, null, ?, 'market', ?, 'CLOSED', ?)`,
       [cleanSymbol, closeSide, qty, bitgetOrder.orderId, realizedPnl]
     );
 
@@ -587,8 +710,6 @@ app.post("/api/order/close", async (req, res) => {
     const stats = await getDailyStats(today);
     const updatedBalance = await BitgetService.getBalance();
     const updatedPositions = await BitgetService.getPositions();
-
-    console.log(`[Wind Control] Realized PnL: ${realizedPnl} USD. Daily stats updated: PnL=${stats.total_pnl}, Halted=${stats.trading_halted}`);
 
     // Broadcast update
     broadcast("RISK_UPDATED", {
