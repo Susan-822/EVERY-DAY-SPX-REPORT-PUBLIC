@@ -31,6 +31,9 @@ interface Signal {
   calculatedLeverage?: number;
   calculatedQty?: number;
   riskBudget?: number;
+  netR?: number;
+  strategy?: string;
+  expirationTime?: number;
 }
 
 interface Order {
@@ -93,10 +96,13 @@ export default function App() {
     tradingHalted: false
   });
 
-  // Current selected signal for manual action
+  // Current selected signal
   const [activeSignal, setActiveSignal] = useState<Signal | null>(null);
   
-  // Order Execution settings (will be prefilled by AI calculations)
+  // Expiration countdown
+  const [timeLeft, setTimeLeft] = useState<number | null>(null);
+
+  // Order Execution settings
   const [execQty, setExecQty] = useState("10");
   const [execPrice, setExecPrice] = useState("");
   const [execType, setExecType] = useState<"market" | "limit">("market");
@@ -105,8 +111,25 @@ export default function App() {
   const [slPrice, setSlPrice] = useState("");
   const [isExecuting, setIsExecuting] = useState(false);
 
-  // WebSockets ref
   const wsRef = useRef<WebSocket | null>(null);
+
+  // Live countdown timer loop
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (activeSignal && activeSignal.expirationTime) {
+        const diff = activeSignal.expirationTime - Date.now();
+        if (diff <= 0) {
+          setTimeLeft(0);
+        } else {
+          setTimeLeft(Math.floor(diff / 1000));
+        }
+      } else {
+        setTimeLeft(null);
+      }
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [activeSignal]);
 
   // Load initial data
   useEffect(() => {
@@ -116,7 +139,6 @@ export default function App() {
     fetchSignals();
     fetchOrders();
 
-    // WebSocket logic
     const connectWS = () => {
       console.log("[WS] Connecting to server...");
       const ws = new WebSocket(WS_URL);
@@ -125,17 +147,41 @@ export default function App() {
       ws.onmessage = (event) => {
         const payload = JSON.parse(event.data);
         const { event: wsEvent, data } = payload;
-        console.log(`[WS] Event: ${wsEvent}`, data);
 
         if (wsEvent === "NEW_SIGNAL") {
-          setSignals(prev => [data, ...prev]);
-          setActiveSignal(data);
-          // Prefill values based on AI's graded risk sizing
-          setExecQty(data.calculatedQty?.toString() || "10");
-          setExecPrice(data.suggested_entry.toString());
-          setTpPrice(data.suggested_tp.toString());
-          setSlPrice(data.suggested_sl.toString());
-          showNotification(`🔥 发现新的 ${data.signal_grade} 级交易信号 (${data.symbol})!`);
+          // Normalizing grade params
+          let calcData = { calculatedLeverage: 1, calculatedQty: 10, riskBudget: 0, signalGrade: "B", netR: 1.0, strategy: "突破回踩", expirationTime: 0 };
+          try {
+            const rawTv = JSON.parse(data.raw_tv_data);
+            calcData = {
+              calculatedLeverage: rawTv.calculatedLeverage,
+              calculatedQty: rawTv.calculatedQty,
+              riskBudget: rawTv.riskBudget,
+              signalGrade: rawTv.signalGrade,
+              netR: rawTv.netR,
+              strategy: rawTv.strategy,
+              expirationTime: rawTv.expirationTime
+            };
+          } catch(e) {}
+
+          const parsedSignal: Signal = {
+            ...data,
+            signal_grade: calcData.signalGrade,
+            calculatedLeverage: calcData.calculatedLeverage,
+            calculatedQty: calcData.calculatedQty,
+            riskBudget: calcData.riskBudget,
+            netR: calcData.netR,
+            strategy: calcData.strategy,
+            expirationTime: calcData.expirationTime
+          };
+
+          setSignals(prev => [parsedSignal, ...prev]);
+          setActiveSignal(parsedSignal);
+          setExecQty(parsedSignal.calculatedQty?.toString() || "10");
+          setExecPrice(parsedSignal.suggested_entry.toString());
+          setTpPrice(parsedSignal.suggested_tp.toString());
+          setSlPrice(parsedSignal.suggested_sl.toString());
+          showNotification(`🔥 发现新的 ${parsedSignal.signal_grade} 级交易信号 (${parsedSignal.symbol})!`);
         } else if (wsEvent === "ORDER_EXECUTED") {
           fetchOrders();
           fetchPositions();
@@ -147,9 +193,9 @@ export default function App() {
             }
           }
           if (data.order.status === "SUCCESS") {
-            showNotification("✅ 订单已成功提交并在交易所上挂载止损！");
+            showNotification("✅ 订单委托及硬止损同步挂载成功！");
           } else {
-            setErrorMsg(data.order.error || "订单执行风控拦截或计划委托失败。");
+            setErrorMsg(data.order.error || "订单开仓或止损挂单被系统拦截。");
           }
         } else if (wsEvent === "SIGNAL_REJECTED") {
           setSignals(prev => prev.map(s => s.id === data.signalId ? { ...s, status: "REJECTED" } : s));
@@ -164,7 +210,7 @@ export default function App() {
             tradingHalted: data.tradingHalted
           }));
           if (data.tradingHalted) {
-            setErrorMsg("🚨 风控系统警告：今日亏损或连续遭遇3次亏损，系统已停机保护！");
+            setErrorMsg("🛑 风控红色预警：今日亏损或连续错误已触发熔断保护，开仓已停机！");
           }
         }
       };
@@ -182,7 +228,7 @@ export default function App() {
     };
   }, []);
 
-  // Update form fields when active signal changes
+  // Prefill fields when signal changes
   useEffect(() => {
     if (activeSignal) {
       setExecQty(activeSignal.calculatedQty?.toString() || "10");
@@ -253,32 +299,12 @@ export default function App() {
       const res = await fetch(`${BACKEND_URL}/api/signals`);
       const r = await res.json();
       if (r.success) {
-        const parsed = (r.data || []).map((s: any) => {
-          let calcData = { calculatedLeverage: 1, calculatedQty: 10, riskBudget: 0, signalGrade: "B" };
-          try {
-            const rawTv = JSON.parse(s.raw_tv_data);
-            calcData = {
-              calculatedLeverage: rawTv.calculatedLeverage,
-              calculatedQty: rawTv.calculatedQty,
-              riskBudget: rawTv.riskBudget,
-              signalGrade: rawTv.signalGrade
-            };
-          } catch(e) {}
-          return {
-            ...s,
-            signal_grade: calcData.signalGrade,
-            calculatedLeverage: calcData.calculatedLeverage,
-            calculatedQty: calcData.calculatedQty,
-            riskBudget: calcData.riskBudget
-          };
-        });
-
-        setSignals(parsed);
-        const pending = parsed.find((s: Signal) => s.status === "PENDING");
+        setSignals(r.data || []);
+        const pending = (r.data || []).find((s: Signal) => s.status === "PENDING");
         if (pending) {
           setActiveSignal(pending);
-        } else if (parsed.length > 0) {
-          setActiveSignal(parsed[0]);
+        } else if (r.data?.length > 0) {
+          setActiveSignal(r.data[0]);
         }
       }
     } catch (e) {
@@ -303,7 +329,7 @@ export default function App() {
       const res = await fetch(`${BACKEND_URL}/api/risk/reset`, { method: "POST" });
       const data = await res.json();
       if (data.success) {
-        showNotification("🔄 今日风控计数器已重置，系统恢复正常状态！");
+        showNotification("🔄 风控熔断器重置成功，交易系统已重新启动！");
         fetchStatus();
       }
     } catch (e) {
@@ -327,7 +353,7 @@ export default function App() {
         setErrorMsg(data.error || "Analysis failed");
       } else {
         setTicker("");
-        showNotification(`分析完成：${data.data.symbol}`);
+        showNotification(`评级分析已生成: ${data.data.symbol}`);
         fetchSignals();
       }
     } catch (err: any) {
@@ -371,7 +397,7 @@ export default function App() {
   };
 
   const handleClosePosition = async (pos: Position) => {
-    const profitInput = prompt(`请输入平仓这笔 ${pos.symbol} (${pos.side === 'buy'?'多':'空'}) 的实际已实现盈亏 (USD)，将自动更新日内风控：`, pos.unrealizedPL);
+    const profitInput = prompt(`请输入平仓此仓位 ${pos.symbol} 的实际盈亏金额 (USD)，数据将同步更新日内风控：`, pos.unrealizedPL);
     if (profitInput === null) return;
     const realizedPnl = parseFloat(profitInput) || 0;
     
@@ -388,16 +414,16 @@ export default function App() {
       });
       const r = await res.json();
       if (r.success) {
-        showNotification(`✅ 仓位 ${pos.symbol} 已关闭，实现损益: ${realizedPnl} USD`);
+        showNotification(`✅ 仓位已平，实现损益: ${realizedPnl} USD`);
         fetchPositions();
         fetchOrders();
         fetchBalance();
         fetchStatus();
       } else {
-        setErrorMsg(r.error || "平仓处理失败");
+        setErrorMsg(r.error || "平仓动作失败");
       }
     } catch (e: any) {
-      setErrorMsg(e.message || "平仓处理错误");
+      setErrorMsg(e.message || "平仓发生错误");
     }
   };
 
@@ -424,7 +450,7 @@ export default function App() {
           border: "rgba(217, 70, 239, 0.5)",
           color: "#e879f9",
           glow: "0 0 18px rgba(217, 70, 239, 0.4)",
-          name: "S级顶级机会"
+          name: "S级极强机会"
         };
       case "A+":
         return {
@@ -432,7 +458,7 @@ export default function App() {
           border: "rgba(59, 130, 246, 0.5)",
           color: "#60a5fa",
           glow: "0 0 12px rgba(59, 130, 246, 0.3)",
-          name: "A+重点强推"
+          name: "A+级重点机会"
         };
       case "A":
         return {
@@ -440,7 +466,7 @@ export default function App() {
           border: "rgba(16, 185, 129, 0.35)",
           color: "#34d399",
           glow: "none",
-          name: "A级标准配置"
+          name: "A级正常交易"
         };
       case "B":
         return {
@@ -448,7 +474,7 @@ export default function App() {
           border: "rgba(245, 158, 11, 0.3)",
           color: "#fbbf24",
           glow: "none",
-          name: "B级小仓试探"
+          name: "B级观察警报"
         };
       case "C":
       default:
@@ -457,7 +483,7 @@ export default function App() {
           border: "rgba(100, 116, 139, 0.3)",
           color: "#94a3b8",
           glow: "none",
-          name: "C级不建议交易"
+          name: "C级风控禁止"
         };
     }
   };
@@ -473,15 +499,24 @@ export default function App() {
     if (riskTracker.totalPnl <= -30) {
       return (
         <span className="badge-neutral" style={{ padding: "6px 12px", borderRadius: "8px", fontWeight: "700", display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px" }}>
-          ⚠️ 限重仓模式 (Restricted)
+          ⚠️ 限重仓降级模式 (Restricted)
         </span>
       );
     }
     return (
       <span className="badge-long" style={{ padding: "6px 12px", borderRadius: "8px", fontWeight: "700", display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px" }}>
-        🛡️ 系统运行正常 (Active)
+        🛡️ 系统风控就绪 (Active)
       </span>
     );
+  };
+
+  // Convert seconds to MM:SS format
+  const formatTime = (secs: number | null) => {
+    if (secs === null) return "";
+    if (secs <= 0) return "已失效";
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   };
 
   return (
@@ -512,17 +547,15 @@ export default function App() {
           <div>
             <h1 style={{ fontSize: "20px", fontWeight: "700" }}>ANTIGRAVITY WHALE</h1>
             <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase", letterSpacing: "1px" }}>
-              Bitget US Stock Wind-Control Dashboard
+              Bitget Stock Derivatives Terminal
             </span>
           </div>
         </div>
 
-        {/* System Risk Badge */}
         <div>
           {getSystemRiskBadge()}
         </div>
 
-        {/* System Status Indicators */}
         <div style={{ display: "flex", gap: "20px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px" }}>
             <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: sysConfig.bitget.configured ? "#10b981" : "#f59e0b" }}></span>
@@ -571,7 +604,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Top Risk Tracker Stats Dashboard */}
+      {/* Top Risk Tracker Panel */}
       <div className="glass-panel" style={{
         margin: "0 24px 16px 24px",
         padding: "16px 24px",
@@ -596,7 +629,7 @@ export default function App() {
           </p>
         </div>
         <div>
-          <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>日内连续连损数</span>
+          <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>日内连损计数</span>
           <p style={{ 
             fontSize: "20px", 
             fontWeight: "800", 
@@ -621,7 +654,7 @@ export default function App() {
             }}
           >
             <RotateCcw size={12} />
-            重置今日风控
+            重置风控熔断
           </button>
         </div>
       </div>
@@ -631,17 +664,17 @@ export default function App() {
         {/* Left Side (8 Columns) */}
         <div className="col-8" style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
           
-          {/* Scan panel */}
+          {/* Scan Center */}
           <div className="glass-panel scanline-effect" style={{ padding: "20px" }}>
             <h2 style={{ fontSize: "16px", marginBottom: "12px", display: "flex", alignItems: "center", gap: "8px" }}>
               <Cpu size={18} color="var(--accent-primary)" />
-              量化风控扫描 (Grader Scanner)
+              高波动标的 AI 扫描评估 (Grader Scanner)
             </h2>
             <form onSubmit={handleAnalyze} style={{ display: "flex", gap: "12px" }}>
               <input
                 type="text"
                 className="glass-input"
-                placeholder="输入交易美股代码 (如: TSLA, AAPL, BABA)..."
+                placeholder="输入交易代码 (如: TSLA, NVDA, SPY)..."
                 value={ticker}
                 onChange={(e) => setTicker(e.target.value)}
                 style={{ flexGrow: 1, fontSize: "14px" }}
@@ -653,7 +686,7 @@ export default function App() {
                 disabled={isAnalyzing || !ticker || riskTracker.tradingHalted}
                 style={{ minWidth: "140px", justifyContent: "center" }}
               >
-                {isAnalyzing ? "深度扫描中..." : "开启 AI 评级分析"}
+                {isAnalyzing ? "正在进行分级计算..." : "开启 AI 分级分析"}
               </button>
             </form>
           </div>
@@ -662,6 +695,8 @@ export default function App() {
           {activeSignal ? (
             (() => {
               const style = getGradeStyle(activeSignal.signal_grade);
+              const isExpired = timeLeft !== null && timeLeft <= 0;
+              
               return (
                 <div className="glass-panel" style={{ 
                   padding: "24px", 
@@ -676,7 +711,6 @@ export default function App() {
                       <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
                         <span style={{ fontSize: "28px", fontWeight: "800", letterSpacing: "-0.03em" }}>{activeSignal.symbol}</span>
                         
-                        {/* Grade Badge */}
                         <div style={{
                           background: style.bg,
                           color: style.color,
@@ -696,39 +730,46 @@ export default function App() {
                           fontSize: "11px",
                           fontWeight: "700"
                         }}>
-                          {activeSignal.direction === "LONG" ? "买多" : activeSignal.direction === "SHORT" ? "开空" : "不建议操作"}
+                          {activeSignal.direction === "LONG" ? "买多" : activeSignal.direction === "SHORT" ? "开空" : "观望"}
                         </span>
                       </div>
                       <span style={{ fontSize: "12px", color: "#64748b", display: "block", marginTop: "4px" }}>
-                        信号生成: {new Date(activeSignal.timestamp).toLocaleString()} | 置信度: {(activeSignal.confidence * 100).toFixed(0)}%
+                        评估策略: {activeSignal.strategy} | 置信度: {(activeSignal.confidence * 100).toFixed(0)}%
                       </span>
                     </div>
                     
-                    <div style={{
-                      padding: "6px 12px",
-                      borderRadius: "8px",
-                      fontSize: "12px",
-                      fontWeight: "600",
-                      backgroundColor: 
-                        activeSignal.status === "EXECUTED" ? "rgba(16, 185, 129, 0.1)" :
-                        activeSignal.status === "REJECTED" ? "rgba(239, 68, 68, 0.1)" : "rgba(99, 102, 241, 0.1)",
-                      color: 
-                        activeSignal.status === "EXECUTED" ? "var(--long-color)" :
-                        activeSignal.status === "REJECTED" ? "var(--short-color)" : "var(--accent-primary)",
-                      border: `1px solid ${
-                        activeSignal.status === "EXECUTED" ? "rgba(16, 185, 129, 0.2)" :
-                        activeSignal.status === "REJECTED" ? "rgba(239, 68, 68, 0.2)" : "rgba(99, 102, 241, 0.2)"
-                      }`
-                    }}>
-                      {activeSignal.status === "PENDING" && "🔔 待手动确认"}
-                      {activeSignal.status === "EXECUTED" && "🚀 已下单成功"}
-                      {activeSignal.status === "REJECTED" && "❌ 已拒绝/被熔断"}
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "4px" }}>
+                      <div style={{
+                        padding: "6px 12px",
+                        borderRadius: "8px",
+                        fontSize: "12px",
+                        fontWeight: "600",
+                        backgroundColor: 
+                          activeSignal.status === "EXECUTED" ? "rgba(16, 185, 129, 0.1)" :
+                          activeSignal.status === "REJECTED" ? "rgba(239, 68, 68, 0.1)" : "rgba(99, 102, 241, 0.1)",
+                        color: 
+                          activeSignal.status === "EXECUTED" ? "var(--long-color)" :
+                          activeSignal.status === "REJECTED" ? "var(--short-color)" : "var(--accent-primary)",
+                        border: `1px solid ${
+                          activeSignal.status === "EXECUTED" ? "rgba(16, 185, 129, 0.2)" :
+                          activeSignal.status === "REJECTED" ? "rgba(239, 68, 68, 0.2)" : "rgba(99, 102, 241, 0.2)"
+                        }`
+                      }}>
+                        {activeSignal.status === "PENDING" && "🔔 待手动确认"}
+                        {activeSignal.status === "EXECUTED" && "🚀 已下单成功"}
+                        {activeSignal.status === "REJECTED" && "❌ 已拒绝/超时失效"}
+                      </div>
+                      {activeSignal.status === "PENDING" && timeLeft !== null && (
+                        <span style={{ fontSize: "11px", color: isExpired ? "#ef4444" : "#94a3b8" }}>
+                          ⏱️ 信号剩余时效: <strong>{formatTime(timeLeft)}</strong>
+                        </span>
+                      )}
                     </div>
                   </div>
 
                   {/* Analysis reasoning */}
                   <div>
-                    <h3 style={{ fontSize: "14px", color: "#94a3b8", marginBottom: "8px" }}>AI 多面行情与期权异动研判</h3>
+                    <h3 style={{ fontSize: "14px", color: "#94a3b8", marginBottom: "8px" }}>AI 5层研判解析</h3>
                     <div style={{
                       background: "rgba(0, 0, 0, 0.25)",
                       padding: "16px",
@@ -742,12 +783,12 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* TradingView embed screenshot */}
+                  {/* TradingView K-Line Screenshot */}
                   {activeSignal.tvScreenshot && (
                     <div>
                       <h3 style={{ fontSize: "14px", color: "#94a3b8", marginBottom: "8px", display: "flex", alignItems: "center", gap: "6px" }}>
                         <ImageIcon size={16} />
-                        K线指标多空走势与形态结构
+                        TradingView 真实股票结构图
                       </h3>
                       <div className="glass-panel" style={{
                         overflow: "hidden",
@@ -764,8 +805,8 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Quant Sizing Confirmation panel */}
-                  {activeSignal.status === "PENDING" && activeSignal.signal_grade !== "C" && (
+                  {/* Option confirm layer */}
+                  {activeSignal.status === "PENDING" && activeSignal.signal_grade !== "C" && activeSignal.signal_grade !== "B" && !isExpired && (
                     <div className="glass-panel" style={{
                       padding: "20px",
                       background: "rgba(99, 102, 241, 0.03)",
@@ -778,33 +819,31 @@ export default function App() {
                           一键量化下单确认 (Position & Risk Prefill)
                         </h3>
                         <span style={{ fontSize: "12px", color: style.color, fontWeight: "600" }}>
-                          单笔风险预算上限: ${activeSignal.riskBudget} USD
+                          单笔风险预算上限: ${activeSignal.riskBudget} USD | 净盈亏比 (Net R): {activeSignal.netR}
                         </span>
                       </div>
 
-                      {/* Display calculations */}
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", marginBottom: "16px" }}>
                         <div style={{ display: "flex", flexDirection: "column", gap: "4px", background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px" }}>
-                          <span style={{ fontSize: "11px", color: "#64748b" }}>建议杠杆</span>
+                          <span style={{ fontSize: "11px", color: "#64748b" }}>建议杠杆挡位</span>
                           <span style={{ fontSize: "16px", fontWeight: "700", color: style.color }}>
-                            {activeSignal.calculatedLeverage}x (档位)
+                            {activeSignal.calculatedLeverage}x
                           </span>
                         </div>
                         <div style={{ display: "flex", flexDirection: "column", gap: "4px", background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px" }}>
-                          <span style={{ fontSize: "11px", color: "#64748b" }}>建议仓位张数</span>
+                          <span style={{ fontSize: "11px", color: "#64748b" }}>仓位开仓张数</span>
                           <span style={{ fontSize: "16px", fontWeight: "700", color: "white" }}>
                             {activeSignal.calculatedQty} 张
                           </span>
                         </div>
                         <div style={{ display: "flex", flexDirection: "column", gap: "4px", background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px" }}>
-                          <span style={{ fontSize: "11px", color: "#64748b" }}>建议开仓/止损</span>
-                          <span style={{ fontSize: "13px", fontWeight: "700", color: "#64748b" }}>
+                          <span style={{ fontSize: "11px", color: "#64748b" }}>下单价格 / 止损价</span>
+                          <span style={{ fontSize: "13px", fontWeight: "700", color: "#94a3b8" }}>
                             ${activeSignal.suggested_entry} / ${activeSignal.suggested_sl}
                           </span>
                         </div>
                       </div>
 
-                      {/* Prefilled Form */}
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", marginBottom: "16px" }}>
                         <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
                           <label style={{ fontSize: "11px", color: "#94a3b8" }}>委托方向</label>
@@ -930,12 +969,43 @@ export default function App() {
                           }}
                         >
                           <X size={16} />
-                          忽略此机会
+                          拒绝信号
                         </button>
                       </div>
                     </div>
                   )}
 
+                  {/* B Grade Guard Warning (Hide button) */}
+                  {activeSignal.signal_grade === "B" && activeSignal.status === "PENDING" && (
+                    <div className="glass-panel" style={{
+                      padding: "16px",
+                      background: "rgba(245, 158, 11, 0.08)",
+                      border: "1px solid rgba(245, 158, 11, 0.2)",
+                      color: "#fbbf24",
+                      fontSize: "13px",
+                      borderRadius: "8px",
+                      textAlign: "center"
+                    }}>
+                      ⚠️ B级信号仅限观察警报。趋势/位置尚未完全确认，不支持手动确认下单。
+                    </div>
+                  )}
+
+                  {/* Expired Signal Guard warning */}
+                  {activeSignal.status === "PENDING" && isExpired && (
+                    <div className="glass-panel" style={{
+                      padding: "16px",
+                      background: "rgba(239, 68, 68, 0.08)",
+                      border: "1px solid rgba(239, 68, 68, 0.2)",
+                      color: "#f87171",
+                      fontSize: "13px",
+                      borderRadius: "8px",
+                      textAlign: "center"
+                    }}>
+                      ⏱️ 下单失败：该交易机会已超过有效窗口时间（已过期失效）。
+                    </div>
+                  )}
+
+                  {/* C Grade Halt Guard warning */}
                   {activeSignal.signal_grade === "C" && (
                     <div className="glass-panel" style={{
                       padding: "16px",
@@ -946,7 +1016,7 @@ export default function App() {
                       borderRadius: "8px",
                       textAlign: "center"
                     }}>
-                      ⚠️ AI 已将此机会评级为 C 级，或者系统判定风险指标已熔断，故拒绝在此开仓。
+                      🛑 系统总闸锁定或评级为 C 级，禁止交易。
                     </div>
                   )}
                 </div>
@@ -975,7 +1045,7 @@ export default function App() {
                 <p style={{ fontSize: "24px", fontWeight: "800", color: "white" }}>${parseFloat(balance.usdtAmount).toLocaleString(undefined, {minimumFractionDigits: 2})}</p>
               </div>
               <div style={{ textAlign: "right" }}>
-                <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>可用可用余额</span>
+                <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>可用余额</span>
                 <p style={{ fontSize: "18px", fontWeight: "700", color: "#10b981" }}>${parseFloat(balance.available).toLocaleString(undefined, {minimumFractionDigits: 2})}</p>
               </div>
             </div>
@@ -1144,10 +1214,10 @@ export default function App() {
                         <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
                           <span style={{ fontWeight: "700", color: "white" }}>{order.symbol}</span>
                           <span style={{
-                            color: order.status === "SUCCESS" ? "var(--long-color)" : "var(--short-color)",
+                            color: order.status === "SUCCESS" ? "var(--long-color)" : order.status === "CLOSED" ? "var(--neutral-color)" : "var(--short-color)",
                             fontWeight: "700"
                           }}>
-                            {order.status === "SUCCESS" ? "执行成功" : order.status === "CLOSED" ? "已平仓" : "执行失败"}
+                            {order.status === "SUCCESS" ? "开仓成功" : order.status === "CLOSED" ? "已平仓" : "执行失败"}
                           </span>
                         </div>
                         <div style={{ display: "flex", justifyContent: "space-between", color: "#64748b" }}>
