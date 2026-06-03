@@ -9,7 +9,9 @@ import {
   DollarSign, 
   Clock, 
   RotateCcw, 
-  Image as ImageIcon 
+  Image as ImageIcon,
+  ShieldAlert,
+  Zap
 } from "lucide-react";
 
 interface Signal {
@@ -25,6 +27,10 @@ interface Signal {
   tvScreenshot?: string;
   uwScreenshot?: string;
   status: "PENDING" | "APPROVED" | "REJECTED" | "EXECUTED";
+  signal_grade: "B" | "A" | "A+" | "S" | "C";
+  calculatedLeverage?: number;
+  calculatedQty?: number;
+  riskBudget?: number;
 }
 
 interface Order {
@@ -37,6 +43,7 @@ interface Order {
   order_type: string;
   bitget_order_id: string;
   status: string;
+  pnl?: number;
 }
 
 interface Position {
@@ -47,6 +54,13 @@ interface Position {
   marketPrice: string;
   unrealizedPL: string;
   mock?: boolean;
+}
+
+interface RiskTracker {
+  today: string;
+  totalPnl: number;
+  consecutiveLosses: number;
+  tradingHalted: boolean;
 }
 
 const BACKEND_URL = "http://localhost:3001";
@@ -71,10 +85,18 @@ export default function App() {
     unusualWhales: { configured: false }
   });
 
+  // Risk Tracker State
+  const [riskTracker, setRiskTracker] = useState<RiskTracker>({
+    today: "",
+    totalPnl: 0,
+    consecutiveLosses: 0,
+    tradingHalted: false
+  });
+
   // Current selected signal for manual action
   const [activeSignal, setActiveSignal] = useState<Signal | null>(null);
   
-  // Order Execution settings
+  // Order Execution settings (will be prefilled by AI calculations)
   const [execQty, setExecQty] = useState("10");
   const [execPrice, setExecPrice] = useState("");
   const [execType, setExecType] = useState<"market" | "limit">("market");
@@ -108,26 +130,41 @@ export default function App() {
         if (wsEvent === "NEW_SIGNAL") {
           setSignals(prev => [data, ...prev]);
           setActiveSignal(data);
-          // Set prefilled details
+          // Prefill values based on AI's graded risk sizing
+          setExecQty(data.calculatedQty?.toString() || "10");
           setExecPrice(data.suggested_entry.toString());
           setTpPrice(data.suggested_tp.toString());
           setSlPrice(data.suggested_sl.toString());
-          showNotification("🔥 New AI Trade Signal Received!");
+          showNotification(`🔥 发现新的 ${data.signal_grade} 级交易信号 (${data.symbol})!`);
         } else if (wsEvent === "ORDER_EXECUTED") {
           fetchOrders();
           fetchPositions();
           fetchBalance();
           if (data.signalId) {
-            setSignals(prev => prev.map(s => s.id === data.signalId ? { ...s, status: "EXECUTED" } : s));
+            setSignals(prev => prev.map(s => s.id === data.signalId ? { ...s, status: data.order.status === "SUCCESS" ? "EXECUTED" : "REJECTED" } : s));
             if (activeSignal && activeSignal.id === data.signalId) {
-              setActiveSignal(prev => prev ? { ...prev, status: "EXECUTED" } : null);
+              setActiveSignal(prev => prev ? { ...prev, status: data.order.status === "SUCCESS" ? "EXECUTED" : "REJECTED" } : null);
             }
           }
-          showNotification("✅ Order Placed Successfully on Bitget!");
+          if (data.order.status === "SUCCESS") {
+            showNotification("✅ 订单已成功提交并在交易所上挂载止损！");
+          } else {
+            setErrorMsg(data.order.error || "订单执行风控拦截或计划委托失败。");
+          }
         } else if (wsEvent === "SIGNAL_REJECTED") {
           setSignals(prev => prev.map(s => s.id === data.signalId ? { ...s, status: "REJECTED" } : s));
           if (activeSignal && activeSignal.id === data.signalId) {
             setActiveSignal(prev => prev ? { ...prev, status: "REJECTED" } : null);
+          }
+        } else if (wsEvent === "RISK_UPDATED") {
+          setRiskTracker(prev => ({
+            ...prev,
+            totalPnl: data.totalPnl,
+            consecutiveLosses: data.consecutiveLosses,
+            tradingHalted: data.tradingHalted
+          }));
+          if (data.tradingHalted) {
+            setErrorMsg("🚨 风控系统警告：今日亏损或连续遭遇3次亏损，系统已停机保护！");
           }
         }
       };
@@ -145,9 +182,10 @@ export default function App() {
     };
   }, []);
 
-  // Set default values whenever active signal changes
+  // Update form fields when active signal changes
   useEffect(() => {
     if (activeSignal) {
+      setExecQty(activeSignal.calculatedQty?.toString() || "10");
       setExecPrice(activeSignal.suggested_entry.toString());
       setTpPrice(activeSignal.suggested_tp.toString());
       setSlPrice(activeSignal.suggested_sl.toString());
@@ -165,6 +203,9 @@ export default function App() {
       const res = await fetch(`${BACKEND_URL}/api/status`);
       const data = await res.json();
       setSysConfig(data);
+      if (data.riskTracker) {
+        setRiskTracker(data.riskTracker);
+      }
     } catch (e) {
       console.error(e);
     }
@@ -176,7 +217,6 @@ export default function App() {
       const r = await res.json();
       if (r.success) {
         if (Array.isArray(r.data)) {
-          // If Bitget returns array
           const usdtAcc = r.data.find((a: any) => a.marginCoin === "USDT");
           setBalance({
             usdtAmount: usdtAcc?.equity || "0.00",
@@ -213,13 +253,32 @@ export default function App() {
       const res = await fetch(`${BACKEND_URL}/api/signals`);
       const r = await res.json();
       if (r.success) {
-        setSignals(r.data || []);
-        // Pick first pending or first signal
-        const pending = (r.data || []).find((s: Signal) => s.status === "PENDING");
+        const parsed = (r.data || []).map((s: any) => {
+          let calcData = { calculatedLeverage: 1, calculatedQty: 10, riskBudget: 0, signalGrade: "B" };
+          try {
+            const rawTv = JSON.parse(s.raw_tv_data);
+            calcData = {
+              calculatedLeverage: rawTv.calculatedLeverage,
+              calculatedQty: rawTv.calculatedQty,
+              riskBudget: rawTv.riskBudget,
+              signalGrade: rawTv.signalGrade
+            };
+          } catch(e) {}
+          return {
+            ...s,
+            signal_grade: calcData.signalGrade,
+            calculatedLeverage: calcData.calculatedLeverage,
+            calculatedQty: calcData.calculatedQty,
+            riskBudget: calcData.riskBudget
+          };
+        });
+
+        setSignals(parsed);
+        const pending = parsed.find((s: Signal) => s.status === "PENDING");
         if (pending) {
           setActiveSignal(pending);
-        } else if (r.data?.length > 0) {
-          setActiveSignal(r.data[0]);
+        } else if (parsed.length > 0) {
+          setActiveSignal(parsed[0]);
         }
       }
     } catch (e) {
@@ -239,7 +298,19 @@ export default function App() {
     }
   };
 
-  // Trigger analysis
+  const handleResetRisk = async () => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/risk/reset`, { method: "POST" });
+      const data = await res.json();
+      if (data.success) {
+        showNotification("🔄 今日风控计数器已重置，系统恢复正常状态！");
+        fetchStatus();
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   const handleAnalyze = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!ticker) return;
@@ -256,7 +327,8 @@ export default function App() {
         setErrorMsg(data.error || "Analysis failed");
       } else {
         setTicker("");
-        showNotification(`Successfully completed analysis for ${data.data.symbol}!`);
+        showNotification(`分析完成：${data.data.symbol}`);
+        fetchSignals();
       }
     } catch (err: any) {
       setErrorMsg(err.message || "Failed to contact backend server");
@@ -265,7 +337,6 @@ export default function App() {
     }
   };
 
-  // Approve and execute manual order
   const handleExecuteOrder = async () => {
     if (!activeSignal) return;
     setIsExecuting(true);
@@ -289,6 +360,8 @@ export default function App() {
       const data = await res.json();
       if (!data.success) {
         setErrorMsg(data.error || "Order execution failed");
+      } else {
+        fetchStatus();
       }
     } catch (err: any) {
       setErrorMsg(err.message || "Order placing failed");
@@ -297,7 +370,37 @@ export default function App() {
     }
   };
 
-  // Reject trade suggestion
+  const handleClosePosition = async (pos: Position) => {
+    const profitInput = prompt(`请输入平仓这笔 ${pos.symbol} (${pos.side === 'buy'?'多':'空'}) 的实际已实现盈亏 (USD)，将自动更新日内风控：`, pos.unrealizedPL);
+    if (profitInput === null) return;
+    const realizedPnl = parseFloat(profitInput) || 0;
+    
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/order/close`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: pos.symbol,
+          side: pos.side,
+          qty: pos.holdQty,
+          pnl: realizedPnl
+        })
+      });
+      const r = await res.json();
+      if (r.success) {
+        showNotification(`✅ 仓位 ${pos.symbol} 已关闭，实现损益: ${realizedPnl} USD`);
+        fetchPositions();
+        fetchOrders();
+        fetchBalance();
+        fetchStatus();
+      } else {
+        setErrorMsg(r.error || "平仓处理失败");
+      }
+    } catch (e: any) {
+      setErrorMsg(e.message || "平仓处理错误");
+    }
+  };
+
   const handleRejectSignal = async () => {
     if (!activeSignal) return;
     try {
@@ -306,9 +409,79 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ signalId: activeSignal.id })
       });
+      fetchSignals();
     } catch (e) {
       console.error(e);
     }
+  };
+
+  // Helper styles based on signal grade
+  const getGradeStyle = (grade: string) => {
+    switch (grade) {
+      case "S":
+        return {
+          bg: "linear-gradient(135deg, rgba(236, 72, 153, 0.2) 0%, rgba(217, 70, 239, 0.2) 100%)",
+          border: "rgba(217, 70, 239, 0.5)",
+          color: "#e879f9",
+          glow: "0 0 18px rgba(217, 70, 239, 0.4)",
+          name: "S级顶级机会"
+        };
+      case "A+":
+        return {
+          bg: "linear-gradient(135deg, rgba(59, 130, 246, 0.2) 0%, rgba(16, 185, 129, 0.2) 100%)",
+          border: "rgba(59, 130, 246, 0.5)",
+          color: "#60a5fa",
+          glow: "0 0 12px rgba(59, 130, 246, 0.3)",
+          name: "A+重点强推"
+        };
+      case "A":
+        return {
+          bg: "rgba(16, 185, 129, 0.12)",
+          border: "rgba(16, 185, 129, 0.35)",
+          color: "#34d399",
+          glow: "none",
+          name: "A级标准配置"
+        };
+      case "B":
+        return {
+          bg: "rgba(245, 158, 11, 0.1)",
+          border: "rgba(245, 158, 11, 0.3)",
+          color: "#fbbf24",
+          glow: "none",
+          name: "B级小仓试探"
+        };
+      case "C":
+      default:
+        return {
+          bg: "rgba(100, 116, 139, 0.1)",
+          border: "rgba(100, 116, 139, 0.3)",
+          color: "#94a3b8",
+          glow: "none",
+          name: "C级不建议交易"
+        };
+    }
+  };
+
+  const getSystemRiskBadge = () => {
+    if (riskTracker.tradingHalted) {
+      return (
+        <span className="badge-short" style={{ padding: "6px 12px", borderRadius: "8px", fontWeight: "700", display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px" }}>
+          <ShieldAlert size={14} /> 🛑 系统熔断停机 (HALTED)
+        </span>
+      );
+    }
+    if (riskTracker.totalPnl <= -30) {
+      return (
+        <span className="badge-neutral" style={{ padding: "6px 12px", borderRadius: "8px", fontWeight: "700", display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px" }}>
+          ⚠️ 限重仓模式 (Restricted)
+        </span>
+      );
+    }
+    return (
+      <span className="badge-long" style={{ padding: "6px 12px", borderRadius: "8px", fontWeight: "700", display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px" }}>
+        🛡️ 系统运行正常 (Active)
+      </span>
+    );
   };
 
   return (
@@ -339,27 +512,27 @@ export default function App() {
           <div>
             <h1 style={{ fontSize: "20px", fontWeight: "700" }}>ANTIGRAVITY WHALE</h1>
             <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase", letterSpacing: "1px" }}>
-              Bitget Stock Derivatives Terminal
+              Bitget US Stock Wind-Control Dashboard
             </span>
           </div>
         </div>
 
-        {/* System Indicators */}
+        {/* System Risk Badge */}
+        <div>
+          {getSystemRiskBadge()}
+        </div>
+
+        {/* System Status Indicators */}
         <div style={{ display: "flex", gap: "20px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px" }}>
             <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: sysConfig.bitget.configured ? "#10b981" : "#f59e0b" }}></span>
             <span style={{ color: "#94a3b8" }}>Bitget API:</span>
-            <span style={{ color: "white", fontWeight: "500" }}>{sysConfig.bitget.configured ? "Ready" : "Demo Mode"}</span>
+            <span style={{ color: "white", fontWeight: "500" }}>{sysConfig.bitget.configured ? "Ready" : "Demo"}</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px" }}>
             <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: sysConfig.openai.configured ? "#10b981" : "#ef4444" }}></span>
             <span style={{ color: "#94a3b8" }}>OpenAI:</span>
             <span style={{ color: "white", fontWeight: "500" }}>{sysConfig.openai.configured ? "Ready" : "Simulated"}</span>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px" }}>
-            <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: "#10b981" }}></span>
-            <span style={{ color: "#94a3b8" }}>DB:</span>
-            <span style={{ color: "white", fontWeight: "500" }}>Connected</span>
           </div>
         </div>
       </header>
@@ -398,291 +571,411 @@ export default function App() {
         </div>
       )}
 
+      {/* Top Risk Tracker Stats Dashboard */}
+      <div className="glass-panel" style={{
+        margin: "0 24px 16px 24px",
+        padding: "16px 24px",
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr 1fr 1fr",
+        gap: "16px",
+        background: "linear-gradient(180deg, rgba(17, 24, 39, 0.8) 0%, rgba(3, 7, 18, 0.9) 100%)"
+      }}>
+        <div>
+          <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>今日风控日期</span>
+          <p style={{ fontSize: "16px", fontWeight: "700", color: "white", marginTop: "4px" }}>{riskTracker.today || "N/A"}</p>
+        </div>
+        <div>
+          <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>当日平仓盈亏</span>
+          <p style={{ 
+            fontSize: "20px", 
+            fontWeight: "800", 
+            color: riskTracker.totalPnl >= 0 ? "#10b981" : "#ef4444",
+            marginTop: "4px" 
+          }}>
+            {riskTracker.totalPnl >= 0 ? "+" : ""}${riskTracker.totalPnl.toFixed(2)}
+          </p>
+        </div>
+        <div>
+          <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>日内连续连损数</span>
+          <p style={{ 
+            fontSize: "20px", 
+            fontWeight: "800", 
+            color: riskTracker.consecutiveLosses >= 2 ? "#ef4444" : "white",
+            marginTop: "4px" 
+          }}>
+            {riskTracker.consecutiveLosses} / 3 连损
+          </p>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end" }}>
+          <button 
+            className="glass-input" 
+            onClick={handleResetRisk}
+            style={{ 
+              fontSize: "12px", 
+              cursor: "pointer", 
+              padding: "6px 12px", 
+              background: "rgba(255,255,255,0.05)",
+              display: "flex",
+              alignItems: "center",
+              gap: "4px"
+            }}
+          >
+            <RotateCcw size={12} />
+            重置今日风控
+          </button>
+        </div>
+      </div>
+
       {/* Main Grid Layout */}
       <div className="grid-container">
-        {/* Left Side: Controls, AI recommendation, chart & execution (8 Columns) */}
+        {/* Left Side (8 Columns) */}
         <div className="col-8" style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
           
-          {/* Section: Trigger Ticker Scan */}
+          {/* Scan panel */}
           <div className="glass-panel scanline-effect" style={{ padding: "20px" }}>
             <h2 style={{ fontSize: "16px", marginBottom: "12px", display: "flex", alignItems: "center", gap: "8px" }}>
               <Cpu size={18} color="var(--accent-primary)" />
-              扫描分析中心 (AI Scanner Center)
+              量化风控扫描 (Grader Scanner)
             </h2>
             <form onSubmit={handleAnalyze} style={{ display: "flex", gap: "12px" }}>
               <input
                 type="text"
                 className="glass-input"
-                placeholder="输入股票代码 (如: TSLA, AAPL, NVDA)..."
+                placeholder="输入交易美股代码 (如: TSLA, AAPL, BABA)..."
                 value={ticker}
                 onChange={(e) => setTicker(e.target.value)}
                 style={{ flexGrow: 1, fontSize: "14px" }}
-                disabled={isAnalyzing}
+                disabled={isAnalyzing || riskTracker.tradingHalted}
               />
               <button 
                 type="submit" 
                 className="glass-button" 
-                disabled={isAnalyzing || !ticker}
+                disabled={isAnalyzing || !ticker || riskTracker.tradingHalted}
                 style={{ minWidth: "140px", justifyContent: "center" }}
               >
-                {isAnalyzing ? "正在进行深度分析..." : "开启 AI 扫描"}
+                {isAnalyzing ? "深度扫描中..." : "开启 AI 评级分析"}
               </button>
             </form>
           </div>
 
-          {/* Section: Selected Signal Details & Confirmation */}
+          {/* Graded Signal details */}
           {activeSignal ? (
-            <div className="glass-panel" style={{ padding: "24px", display: "flex", flexDirection: "column", gap: "20px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", borderBottom: "1px solid var(--border-color)", paddingBottom: "16px" }}>
-                <div>
-                  <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-                    <span style={{ fontSize: "28px", fontWeight: "800", letterSpacing: "-0.03em" }}>{activeSignal.symbol}</span>
-                    <span className={`badge-${activeSignal.direction.toLowerCase()}`} style={{
-                      padding: "4px 10px",
-                      borderRadius: "6px",
-                      fontSize: "12px",
-                      fontWeight: "700",
-                      letterSpacing: "0.5px"
-                    }}>
-                      {activeSignal.direction}
-                    </span>
-                    <span style={{ color: "#64748b", fontSize: "13px" }}>
-                      Confidence: {(activeSignal.confidence * 100).toFixed(0)}%
-                    </span>
-                  </div>
-                  <span style={{ fontSize: "12px", color: "#64748b", display: "block", marginTop: "4px" }}>
-                    信号生成时间: {new Date(activeSignal.timestamp).toLocaleString()}
-                  </span>
-                </div>
-                
-                {/* Status indicator badge */}
-                <div style={{
-                  padding: "6px 12px",
-                  borderRadius: "8px",
-                  fontSize: "12px",
-                  fontWeight: "600",
-                  backgroundColor: 
-                    activeSignal.status === "EXECUTED" ? "rgba(16, 185, 129, 0.1)" :
-                    activeSignal.status === "REJECTED" ? "rgba(239, 68, 68, 0.1)" : "rgba(99, 102, 241, 0.1)",
-                  color: 
-                    activeSignal.status === "EXECUTED" ? "var(--long-color)" :
-                    activeSignal.status === "REJECTED" ? "var(--short-color)" : "var(--accent-primary)",
-                  border: `1px solid ${
-                    activeSignal.status === "EXECUTED" ? "rgba(16, 185, 129, 0.2)" :
-                    activeSignal.status === "REJECTED" ? "rgba(239, 68, 68, 0.2)" : "rgba(99, 102, 241, 0.2)"
-                  }`
+            (() => {
+              const style = getGradeStyle(activeSignal.signal_grade);
+              return (
+                <div className="glass-panel" style={{ 
+                  padding: "24px", 
+                  display: "flex", 
+                  flexDirection: "column", 
+                  gap: "20px",
+                  border: `1px solid ${style.border}`,
+                  boxShadow: style.glow
                 }}>
-                  {activeSignal.status === "PENDING" && "🔔 待确认交易"}
-                  {activeSignal.status === "EXECUTED" && "🚀 已下单执行"}
-                  {activeSignal.status === "REJECTED" && "❌ 已拒绝忽略"}
-                </div>
-              </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", borderBottom: "1px solid var(--border-color)", paddingBottom: "16px" }}>
+                    <div>
+                      <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                        <span style={{ fontSize: "28px", fontWeight: "800", letterSpacing: "-0.03em" }}>{activeSignal.symbol}</span>
+                        
+                        {/* Grade Badge */}
+                        <div style={{
+                          background: style.bg,
+                          color: style.color,
+                          border: `1px solid ${style.border}`,
+                          padding: "4px 10px",
+                          borderRadius: "6px",
+                          fontSize: "12px",
+                          fontWeight: "800",
+                          letterSpacing: "0.5px"
+                        }}>
+                          {style.name}
+                        </div>
 
-              {/* Reasoning Block */}
-              <div>
-                <h3 style={{ fontSize: "14px", color: "#94a3b8", marginBottom: "8px" }}>AI 综合策略理由</h3>
-                <div style={{
-                  background: "rgba(0, 0, 0, 0.25)",
-                  padding: "16px",
-                  borderRadius: "8px",
-                  border: "1px solid var(--border-color)",
-                  lineHeight: "1.6",
-                  fontSize: "14px",
-                  color: "#cbd5e1"
-                }}>
-                  {activeSignal.reasoning}
-                </div>
-              </div>
-
-              {/* Multimodal Screenshot Block */}
-              {activeSignal.tvScreenshot && (
-                <div>
-                  <h3 style={{ fontSize: "14px", color: "#94a3b8", marginBottom: "8px", display: "flex", alignItems: "center", gap: "6px" }}>
-                    <ImageIcon size={16} />
-                    TradingView K线及指标视觉截图
-                  </h3>
-                  <div className="glass-panel" style={{
-                    overflow: "hidden",
-                    borderRadius: "10px",
-                    maxHeight: "350px",
-                    background: "#0d0e12"
-                  }}>
-                    <img 
-                      src={`${BACKEND_URL}/screenshots/${activeSignal.tvScreenshot}`} 
-                      alt="TradingView Chart"
-                      style={{ width: "100%", height: "auto", display: "block", opacity: "0.85" }}
-                    />
-                  </div>
-                </div>
-              )}
-
-              {/* Order Execution Settings Panel */}
-              {activeSignal.status === "PENDING" && (
-                <div className="glass-panel" style={{
-                  padding: "20px",
-                  background: "rgba(99, 102, 241, 0.04)",
-                  border: "1px solid rgba(99, 102, 241, 0.15)",
-                  borderRadius: "12px"
-                }}>
-                  <h3 style={{ fontSize: "15px", fontWeight: "600", marginBottom: "14px", color: "white" }}>
-                    ⚡ 确认并下单至 Bitget USDT-FUTURES
-                  </h3>
-
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", marginBottom: "16px" }}>
-                    <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                      <label style={{ fontSize: "11px", color: "#94a3b8" }}>委托方向</label>
-                      <div className={`badge-${activeSignal.direction.toLowerCase()}`} style={{
-                        padding: "8px 12px",
-                        borderRadius: "8px",
-                        textAlign: "center",
-                        fontWeight: "700",
-                        fontSize: "14px"
-                      }}>
-                        {activeSignal.direction === "LONG" ? "买入开多 (LONG)" : "卖出开空 (SHORT)"}
+                        <span className={`badge-${activeSignal.direction.toLowerCase()}`} style={{
+                          padding: "4px 8px",
+                          borderRadius: "4px",
+                          fontSize: "11px",
+                          fontWeight: "700"
+                        }}>
+                          {activeSignal.direction === "LONG" ? "买多" : activeSignal.direction === "SHORT" ? "开空" : "不建议操作"}
+                        </span>
                       </div>
+                      <span style={{ fontSize: "12px", color: "#64748b", display: "block", marginTop: "4px" }}>
+                        信号生成: {new Date(activeSignal.timestamp).toLocaleString()} | 置信度: {(activeSignal.confidence * 100).toFixed(0)}%
+                      </span>
                     </div>
-
-                    <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                      <label style={{ fontSize: "11px", color: "#94a3b8" }}>委托类型</label>
-                      <select 
-                        className="glass-input" 
-                        value={execType} 
-                        onChange={(e) => setExecType(e.target.value as any)}
-                        style={{ background: "#0b0c16", padding: "8px 12px", height: "38px" }}
-                      >
-                        <option value="market">市价委托 (Market)</option>
-                        <option value="limit">限价委托 (Limit)</option>
-                      </select>
-                    </div>
-
-                    <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                      <label style={{ fontSize: "11px", color: "#94a3b8" }}>数量 (合约张数/Size)</label>
-                      <input 
-                        type="number" 
-                        className="glass-input"
-                        value={execQty}
-                        onChange={(e) => setExecQty(e.target.value)}
-                        style={{ height: "38px" }}
-                      />
+                    
+                    <div style={{
+                      padding: "6px 12px",
+                      borderRadius: "8px",
+                      fontSize: "12px",
+                      fontWeight: "600",
+                      backgroundColor: 
+                        activeSignal.status === "EXECUTED" ? "rgba(16, 185, 129, 0.1)" :
+                        activeSignal.status === "REJECTED" ? "rgba(239, 68, 68, 0.1)" : "rgba(99, 102, 241, 0.1)",
+                      color: 
+                        activeSignal.status === "EXECUTED" ? "var(--long-color)" :
+                        activeSignal.status === "REJECTED" ? "var(--short-color)" : "var(--accent-primary)",
+                      border: `1px solid ${
+                        activeSignal.status === "EXECUTED" ? "rgba(16, 185, 129, 0.2)" :
+                        activeSignal.status === "REJECTED" ? "rgba(239, 68, 68, 0.2)" : "rgba(99, 102, 241, 0.2)"
+                      }`
+                    }}>
+                      {activeSignal.status === "PENDING" && "🔔 待手动确认"}
+                      {activeSignal.status === "EXECUTED" && "🚀 已下单成功"}
+                      {activeSignal.status === "REJECTED" && "❌ 已拒绝/被熔断"}
                     </div>
                   </div>
 
-                  {execType === "limit" && (
-                    <div style={{ display: "flex", flexDirection: "column", gap: "4px", marginBottom: "16px" }}>
-                      <label style={{ fontSize: "11px", color: "#94a3b8" }}>限价委托价格 (USD)</label>
-                      <input 
-                        type="number" 
-                        className="glass-input"
-                        value={execPrice}
-                        onChange={(e) => setExecPrice(e.target.value)}
-                        step="0.01"
-                      />
+                  {/* Analysis reasoning */}
+                  <div>
+                    <h3 style={{ fontSize: "14px", color: "#94a3b8", marginBottom: "8px" }}>AI 多面行情与期权异动研判</h3>
+                    <div style={{
+                      background: "rgba(0, 0, 0, 0.25)",
+                      padding: "16px",
+                      borderRadius: "8px",
+                      border: "1px solid var(--border-color)",
+                      lineHeight: "1.6",
+                      fontSize: "14px",
+                      color: "#cbd5e1"
+                    }}>
+                      {activeSignal.reasoning}
+                    </div>
+                  </div>
+
+                  {/* TradingView embed screenshot */}
+                  {activeSignal.tvScreenshot && (
+                    <div>
+                      <h3 style={{ fontSize: "14px", color: "#94a3b8", marginBottom: "8px", display: "flex", alignItems: "center", gap: "6px" }}>
+                        <ImageIcon size={16} />
+                        K线指标多空走势与形态结构
+                      </h3>
+                      <div className="glass-panel" style={{
+                        overflow: "hidden",
+                        borderRadius: "10px",
+                        maxHeight: "350px",
+                        background: "#0d0e12"
+                      }}>
+                        <img 
+                          src={`${BACKEND_URL}/screenshots/${activeSignal.tvScreenshot}`} 
+                          alt="TradingView"
+                          style={{ width: "100%", height: "auto", display: "block", opacity: "0.85" }}
+                        />
+                      </div>
                     </div>
                   )}
 
-                  {/* TP / SL Config */}
-                  <div style={{ marginBottom: "20px" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "10px" }}>
-                      <input 
-                        type="checkbox" 
-                        id="tpsl" 
-                        checked={enableTPSL}
-                        onChange={(e) => setEnableTPSL(e.target.checked)}
-                        style={{ accentColor: "var(--accent-primary)", width: "16px", height: "16px" }}
-                      />
-                      <label htmlFor="tpsl" style={{ fontSize: "13px", fontWeight: "600", color: "white" }}>
-                        开启止盈止损计划 (Enable TP/SL Plan)
-                      </label>
-                    </div>
+                  {/* Quant Sizing Confirmation panel */}
+                  {activeSignal.status === "PENDING" && activeSignal.signal_grade !== "C" && (
+                    <div className="glass-panel" style={{
+                      padding: "20px",
+                      background: "rgba(99, 102, 241, 0.03)",
+                      border: "1px solid rgba(99, 102, 241, 0.15)",
+                      borderRadius: "12px"
+                    }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
+                        <h3 style={{ fontSize: "15px", fontWeight: "700", color: "white", display: "flex", alignItems: "center", gap: "6px" }}>
+                          <Zap size={16} color="var(--neutral-color)" />
+                          一键量化下单确认 (Position & Risk Prefill)
+                        </h3>
+                        <span style={{ fontSize: "12px", color: style.color, fontWeight: "600" }}>
+                          单笔风险预算上限: ${activeSignal.riskBudget} USD
+                        </span>
+                      </div>
 
-                    {enableTPSL && (
-                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
-                        <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                          <label style={{ fontSize: "11px", color: "#34d399" }}>止盈价格 (Take Profit)</label>
-                          <input 
-                            type="number" 
-                            className="glass-input"
-                            value={tpPrice}
-                            onChange={(e) => setTpPrice(e.target.value)}
-                            step="0.01"
-                            style={{ border: "1px solid rgba(16, 185, 129, 0.2)" }}
-                          />
+                      {/* Display calculations */}
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", marginBottom: "16px" }}>
+                        <div style={{ display: "flex", flexDirection: "column", gap: "4px", background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px" }}>
+                          <span style={{ fontSize: "11px", color: "#64748b" }}>建议杠杆</span>
+                          <span style={{ fontSize: "16px", fontWeight: "700", color: style.color }}>
+                            {activeSignal.calculatedLeverage}x (档位)
+                          </span>
                         </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: "4px", background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px" }}>
+                          <span style={{ fontSize: "11px", color: "#64748b" }}>建议仓位张数</span>
+                          <span style={{ fontSize: "16px", fontWeight: "700", color: "white" }}>
+                            {activeSignal.calculatedQty} 张
+                          </span>
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: "4px", background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px" }}>
+                          <span style={{ fontSize: "11px", color: "#64748b" }}>建议开仓/止损</span>
+                          <span style={{ fontSize: "13px", fontWeight: "700", color: "#64748b" }}>
+                            ${activeSignal.suggested_entry} / ${activeSignal.suggested_sl}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Prefilled Form */}
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", marginBottom: "16px" }}>
                         <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                          <label style={{ fontSize: "11px", color: "#f87171" }}>止损价格 (Stop Loss)</label>
+                          <label style={{ fontSize: "11px", color: "#94a3b8" }}>委托方向</label>
+                          <div className={`badge-${activeSignal.direction.toLowerCase()}`} style={{
+                            padding: "8px 12px",
+                            borderRadius: "8px",
+                            textAlign: "center",
+                            fontWeight: "700",
+                            fontSize: "13px"
+                          }}>
+                            {activeSignal.direction === "LONG" ? "买入开多 (LONG)" : "卖出开空 (SHORT)"}
+                          </div>
+                        </div>
+
+                        <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                          <label style={{ fontSize: "11px", color: "#94a3b8" }}>委托类型</label>
+                          <select 
+                            className="glass-input" 
+                            value={execType} 
+                            onChange={(e) => setExecType(e.target.value as any)}
+                            style={{ background: "#0b0c16", padding: "8px 12px", height: "38px" }}
+                          >
+                            <option value="market">市价委托 (Market)</option>
+                            <option value="limit">限价委托 (Limit)</option>
+                          </select>
+                        </div>
+
+                        <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                          <label style={{ fontSize: "11px", color: "#94a3b8" }}>实际下单张数 (Size)</label>
                           <input 
                             type="number" 
                             className="glass-input"
-                            value={slPrice}
-                            onChange={(e) => setSlPrice(e.target.value)}
-                            step="0.01"
-                            style={{ border: "1px solid rgba(239, 68, 68, 0.2)" }}
+                            value={execQty}
+                            onChange={(e) => setExecQty(e.target.value)}
+                            style={{ height: "38px" }}
                           />
                         </div>
                       </div>
-                    )}
-                  </div>
 
-                  {/* Actions buttons */}
-                  <div style={{ display: "flex", gap: "12px" }}>
-                    <button 
-                      className="glass-button" 
-                      onClick={handleExecuteOrder} 
-                      disabled={isExecuting}
-                      style={{
-                        flexGrow: 1, 
-                        justifyContent: "center",
-                        background: "linear-gradient(135deg, #10b981 0%, #059669 100%)",
-                        boxShadow: "0 4px 14px rgba(16, 185, 129, 0.4)"
-                      }}
-                    >
-                      {isExecuting ? "正在下单中..." : "确认并一键下单 (Approve & Exec)"}
-                    </button>
-                    
-                    <button 
-                      onClick={handleRejectSignal} 
-                      className="glass-input" 
-                      style={{
-                        padding: "10px 20px", 
-                        cursor: "pointer", 
-                        background: "rgba(255,255,255,0.05)",
-                        fontWeight: "600",
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "6px"
-                      }}
-                    >
-                      <X size={16} />
-                      拒绝信号
-                    </button>
-                  </div>
+                      {execType === "limit" && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "4px", marginBottom: "16px" }}>
+                          <label style={{ fontSize: "11px", color: "#94a3b8" }}>限价委托价格 (USD)</label>
+                          <input 
+                            type="number" 
+                            className="glass-input"
+                            value={execPrice}
+                            onChange={(e) => setExecPrice(e.target.value)}
+                            step="0.01"
+                          />
+                        </div>
+                      )}
+
+                      {/* TP / SL Config */}
+                      <div style={{ marginBottom: "20px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "10px" }}>
+                          <input 
+                            type="checkbox" 
+                            id="tpsl" 
+                            checked={enableTPSL}
+                            onChange={(e) => setEnableTPSL(e.target.checked)}
+                            style={{ accentColor: "var(--accent-primary)", width: "16px", height: "16px" }}
+                          />
+                          <label htmlFor="tpsl" style={{ fontSize: "13px", fontWeight: "600", color: "white" }}>
+                            绑定交易所硬性计划止损 (Bitget Hard SL/TP)
+                          </label>
+                        </div>
+
+                        {enableTPSL && (
+                          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+                            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                              <label style={{ fontSize: "11px", color: "#34d399" }}>止盈价格 (Take Profit)</label>
+                              <input 
+                                type="number" 
+                                className="glass-input"
+                                value={tpPrice}
+                                onChange={(e) => setTpPrice(e.target.value)}
+                                step="0.01"
+                                style={{ border: "1px solid rgba(16, 185, 129, 0.2)" }}
+                              />
+                            </div>
+                            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                              <label style={{ fontSize: "11px", color: "#f87171" }}>止损价格 (Stop Loss)</label>
+                              <input 
+                                type="number" 
+                                className="glass-input"
+                                value={slPrice}
+                                onChange={(e) => setSlPrice(e.target.value)}
+                                step="0.01"
+                                style={{ border: "1px solid rgba(239, 68, 68, 0.2)" }}
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Actions buttons */}
+                      <div style={{ display: "flex", gap: "12px" }}>
+                        <button 
+                          className="glass-button" 
+                          onClick={handleExecuteOrder} 
+                          disabled={isExecuting || riskTracker.tradingHalted}
+                          style={{
+                            flexGrow: 1, 
+                            justifyContent: "center",
+                            background: "linear-gradient(135deg, #10b981 0%, #059669 100%)",
+                            boxShadow: "0 4px 14px rgba(16, 185, 129, 0.4)"
+                          }}
+                        >
+                          {isExecuting ? "正在发出委托中..." : "确认并一键下单 (Confirm & Exec)"}
+                        </button>
+                        
+                        <button 
+                          onClick={handleRejectSignal} 
+                          className="glass-input" 
+                          style={{
+                            padding: "10px 20px", 
+                            cursor: "pointer", 
+                            background: "rgba(255,255,255,0.05)",
+                            fontWeight: "600",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "6px"
+                          }}
+                        >
+                          <X size={16} />
+                          忽略此机会
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {activeSignal.signal_grade === "C" && (
+                    <div className="glass-panel" style={{
+                      padding: "16px",
+                      background: "rgba(100, 116, 139, 0.08)",
+                      border: "1px solid rgba(100, 116, 139, 0.2)",
+                      color: "#94a3b8",
+                      fontSize: "13px",
+                      borderRadius: "8px",
+                      textAlign: "center"
+                    }}>
+                      ⚠️ AI 已将此机会评级为 C 级，或者系统判定风险指标已熔断，故拒绝在此开仓。
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
+              );
+            })()
           ) : (
             <div className="glass-panel" style={{ padding: "40px", textAlign: "center", color: "#64748b" }}>
               <Clock size={40} style={{ margin: "0 auto 12px auto", opacity: "0.5" }} />
-              <p>暂无交易信号。请输入股票代码并启动 AI 扫描分析！</p>
+              <p>暂无扫描机会。输入股票代码发起 AI Grader 扫描！</p>
             </div>
           )}
         </div>
 
-        {/* Right Side: Account Balance, Position Lists & History Logs (4 Columns) */}
+        {/* Right Side (4 Columns) */}
         <div className="col-4" style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
           
           {/* Card: Account Balance */}
           <div className="glass-panel" style={{ padding: "20px" }}>
             <h2 style={{ fontSize: "15px", marginBottom: "14px", display: "flex", alignItems: "center", gap: "8px" }}>
               <DollarSign size={16} color="var(--neutral-color)" />
-              资金账户状态 (Account Balance)
+              资金账户状态 (Bitget Balance)
             </h2>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div>
-                <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>账户权益 (USDT)</span>
+                <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>账户总权益</span>
                 <p style={{ fontSize: "24px", fontWeight: "800", color: "white" }}>${parseFloat(balance.usdtAmount).toLocaleString(undefined, {minimumFractionDigits: 2})}</p>
               </div>
               <div style={{ textAlign: "right" }}>
-                <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>可用余额 (USDT)</span>
+                <span style={{ fontSize: "11px", color: "#64748b", textTransform: "uppercase" }}>可用可用余额</span>
                 <p style={{ fontSize: "18px", fontWeight: "700", color: "#10b981" }}>${parseFloat(balance.available).toLocaleString(undefined, {minimumFractionDigits: 2})}</p>
               </div>
             </div>
@@ -693,7 +986,7 @@ export default function App() {
             )}
           </div>
 
-          {/* Card: Active Positions */}
+          {/* Card: Active Positions with Manual Close Option */}
           <div className="glass-panel" style={{ padding: "20px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
               <h2 style={{ fontSize: "15px", display: "flex", alignItems: "center", gap: "8px" }}>
@@ -712,25 +1005,17 @@ export default function App() {
                     background: "rgba(0,0,0,0.2)",
                     border: "1px solid var(--border-color)",
                     padding: "12px",
-                    borderRadius: "8px",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center"
+                    borderRadius: "8px"
                   }}>
-                    <div>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
                       <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                         <span style={{ fontWeight: "700", color: "white" }}>{pos.symbol}</span>
                         <span className={pos.side === "buy" ? "badge-long" : "badge-short"} style={{
-                          fontSize: "10px", padding: "2px 4px", borderRadius: "4px"
+                          fontSize: "10px", padding: "1px 4px", borderRadius: "4px"
                         }}>
                           {pos.side === "buy" ? "LONG" : "SHORT"}
                         </span>
                       </div>
-                      <span style={{ fontSize: "11px", color: "#64748b" }}>
-                        开仓价: ${pos.openPrice} | 数量: {pos.holdQty}
-                      </span>
-                    </div>
-                    <div style={{ textAlign: "right" }}>
                       <p style={{
                         fontSize: "14px",
                         fontWeight: "700",
@@ -738,17 +1023,37 @@ export default function App() {
                       }}>
                         {parseFloat(pos.unrealizedPL) >= 0 ? "+" : ""}${pos.unrealizedPL}
                       </p>
-                      <span style={{ fontSize: "11px", color: "#64748b" }}>标记价: ${pos.marketPrice}</span>
+                    </div>
+                    
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+                      <span style={{ fontSize: "11px", color: "#64748b" }}>
+                        均价: ${pos.openPrice} | 张数: {pos.holdQty}
+                      </span>
+                      <button 
+                        onClick={() => handleClosePosition(pos)}
+                        style={{
+                          background: "rgba(239, 68, 68, 0.15)",
+                          border: "1px solid rgba(239, 68, 68, 0.3)",
+                          color: "#ef4444",
+                          padding: "3px 8px",
+                          borderRadius: "4px",
+                          fontSize: "11px",
+                          fontWeight: "600",
+                          cursor: "pointer"
+                        }}
+                      >
+                        快速平仓
+                      </button>
                     </div>
                   </div>
                 ))}
               </div>
             ) : (
-              <p style={{ fontSize: "12px", color: "#64748b", textAlign: "center", padding: "12px" }}>无活跃仓位</p>
+              <p style={{ fontSize: "12px", color: "#64748b", textAlign: "center", padding: "12px" }}>当前没有未平仓合约</p>
             )}
           </div>
 
-          {/* Card: Signals / Logs History Feed */}
+          {/* Card: History Logs */}
           <div className="glass-panel" style={{ padding: "20px", flexGrow: 1, display: "flex", flexDirection: "column" }}>
             <div style={{ display: "flex", gap: "12px", borderBottom: "1px solid var(--border-color)", marginBottom: "12px", paddingBottom: "4px" }}>
               <button 
@@ -764,7 +1069,7 @@ export default function App() {
                   borderBottom: activeTab === "dashboard" ? "2px solid var(--accent-primary)" : "none"
                 }}
               >
-                信号流历史 (Signals)
+                机会评估流 (Signals)
               </button>
               <button 
                 onClick={() => setActiveTab("history")}
@@ -779,13 +1084,12 @@ export default function App() {
                   borderBottom: activeTab === "history" ? "2px solid var(--accent-primary)" : "none"
                 }}
               >
-                下单记录 (Orders)
+                实盘下单记录 (Orders)
               </button>
             </div>
 
             <div style={{ flexGrow: 1, overflowY: "auto", maxHeight: "350px" }}>
               {activeTab === "dashboard" ? (
-                // Signals Feed list
                 signals.length > 0 ? (
                   <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
                     {signals.map((sig) => (
@@ -803,13 +1107,13 @@ export default function App() {
                       >
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
                           <span style={{ fontWeight: "700", color: "white" }}>{sig.symbol}</span>
-                          <span className={`badge-${sig.direction.toLowerCase()}`} style={{ fontSize: "10px", padding: "1px 4px", borderRadius: "4px" }}>
-                            {sig.direction}
+                          <span style={{ fontSize: "10px", color: getGradeStyle(sig.signal_grade).color, fontWeight: "800" }}>
+                            {sig.signal_grade} 级
                           </span>
                         </div>
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                           <span style={{ fontSize: "11px", color: "#64748b" }}>
-                            {new Date(sig.timestamp).toLocaleTimeString()}
+                            方向: {sig.direction === 'LONG'?'做多':sig.direction==='SHORT'?'开空':'观望'} | {new Date(sig.timestamp).toLocaleTimeString()}
                           </span>
                           <span style={{
                             fontSize: "11px",
@@ -824,10 +1128,9 @@ export default function App() {
                     ))}
                   </div>
                 ) : (
-                  <p style={{ fontSize: "12px", color: "#64748b", textAlign: "center", padding: "20px" }}>暂无分析历史</p>
+                  <p style={{ fontSize: "12px", color: "#64748b", textAlign: "center", padding: "20px" }}>暂无信号评估历史</p>
                 )
               ) : (
-                // Orders History log
                 orders.length > 0 ? (
                   <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
                     {orders.map((order) => (
@@ -841,14 +1144,16 @@ export default function App() {
                         <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
                           <span style={{ fontWeight: "700", color: "white" }}>{order.symbol}</span>
                           <span style={{
-                            color: order.status === "SUCCESS" ? "var(--long-color)" : "var(--short-color)"
+                            color: order.status === "SUCCESS" ? "var(--long-color)" : "var(--short-color)",
+                            fontWeight: "700"
                           }}>
-                            {order.status}
+                            {order.status === "SUCCESS" ? "执行成功" : order.status === "CLOSED" ? "已平仓" : "执行失败"}
                           </span>
                         </div>
                         <div style={{ display: "flex", justifyContent: "space-between", color: "#64748b" }}>
                           <span>
-                            {order.direction === "buy" ? "LONG" : "SHORT"} | Qty: {order.quantity}
+                            {order.direction === "buy" ? "LONG" : "SHORT"} | 张数: {order.quantity}
+                            {order.pnl !== undefined && order.pnl !== 0 && ` | P&L: ${order.pnl >= 0 ? '+' : ''}${order.pnl} USD`}
                           </span>
                           <span>{new Date(order.timestamp).toLocaleTimeString()}</span>
                         </div>
@@ -856,7 +1161,7 @@ export default function App() {
                     ))}
                   </div>
                 ) : (
-                  <p style={{ fontSize: "12px", color: "#64748b", textAlign: "center", padding: "20px" }}>暂无下单记录</p>
+                  <p style={{ fontSize: "12px", color: "#64748b", textAlign: "center", padding: "20px" }}>暂无下单成交记录</p>
                 )
               )}
             </div>
